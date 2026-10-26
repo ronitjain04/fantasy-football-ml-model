@@ -1,61 +1,45 @@
+"""Observed-season features and labels joined by exactly the next calendar year."""
 import numpy as np
 import pandas as pd
 
-def fantasy_points_from_components(row: pd.Series) -> float:
-    g = lambda x: float(x) if pd.notna(x) else 0.0
-    return (
-        0.04 * g(row.get("pass_yds", 0)) + 4.0 * g(row.get("pass_td", 0))
-        + 0.1 * g(row.get("rush_yds", 0)) + 6.0 * g(row.get("rush_td", 0))
-        + 0.1 * g(row.get("rec_yds", 0)) + 6.0 * g(row.get("rec_td", 0))
-        + 1.0 * g(row.get("receptions", 0))
-        - 2.0 * g(row.get("fumbles", 0))
-        - 2.0 * g(row.get("interceptions", 0))
-    )
+FEATURE_COLUMNS = ['fantasy_points', 'ppg', 'games', 'age', 'adp',
+                   'pass_yds', 'pass_td', 'interceptions', 'rush_yds', 'rush_td',
+                   'rec_yds', 'rec_td', 'receptions', 'fumbles_lost',
+                   'is_qb', 'is_rb', 'is_wr', 'is_te']
+TARGET_COLUMN = 'target_next_pts'
+ID_COLUMNS = ['player_id', 'player', 'position', 'team', 'season']
 
-def zscore(s: pd.Series) -> pd.Series:
-    mu = s.mean()
-    sd = s.std(ddof=0)
-    if sd == 0 or np.isnan(sd):
-        return pd.Series(np.zeros(len(s)), index=s.index)
-    return (s - mu) / sd
 
-FEATURE_COLUMNS = [
-    "ppg","ppg_consistency","boom_rate","bust_rate",
-    "adp","adp_z",
-    "pass_yds","pass_td","interceptions",
-    "rush_yds","rush_td","fumbles",
-    "rec_yds","rec_td","receptions",
-    "games"
-]
+def fantasy_points_from_components(row):
+    """Full PPR: 4/pass TD, .04/pass yard, 6/other TD, .1/other yard,
+    1/reception, -2/interception or fumble lost, 2/two-point conversion.
+    Missing components contribute zero; provided PPR totals are preferable.
+    """
+    weights = {'pass_yds': .04, 'pass_td': 4, 'interceptions': -2,
+               'rush_yds': .1, 'rush_td': 6, 'rec_yds': .1, 'rec_td': 6,
+               'receptions': 1, 'fumbles_lost': -2, 'two_point_conversions': 2}
+    return sum(weight * float(row.get(col, 0)) for col, weight in weights.items()
+               if pd.notna(row.get(col, 0)))
 
-TARGET_COLUMN = "target_next_pts"
-ID_COLUMNS = ["player","position","team","season"]
 
-def build_feature_table(df: pd.DataFrame) -> pd.DataFrame:
+def build_feature_table(df):
     data = df.copy()
-
-    if "fantasy_points" not in data.columns:
-        data["fantasy_points"] = data.apply(fantasy_points_from_components, axis=1)
-
-    data["games"] = pd.to_numeric(data.get("games", np.nan), errors="coerce")
-    data["ppg"] = data["fantasy_points"] / data["games"].replace(0, np.nan)
-    data["ppg"] = data["ppg"].fillna(data["fantasy_points"] / 14.0)
-
-    # Approximate weekly consistency from TD variance when weekly data isn't available
-    data["ppg_consistency"] = data[["pass_td","rush_td","rec_td"]].std(axis=1, ddof=0)
-    data["ppg_consistency"] = data["ppg_consistency"].fillna(data["ppg"].std())
-
-    if "adp" in data.columns:
-        data["adp_z"] = data.groupby("season")["adp"].transform(zscore)
-    else:
-        data["adp_z"] = 0.0
-
-    # Boom/bust rate proxies using within-season ppg quantiles
-    data["boom_rate"] = (data["ppg"] > data.groupby("season")["ppg"].transform(lambda s: s.quantile(0.75))).astype(float)
-    data["bust_rate"] = (data["ppg"] < data.groupby("season")["ppg"].transform(lambda s: s.quantile(0.25))).astype(float)
-
-    data = data.sort_values(["player","season"]).reset_index(drop=True)
-    data["target_next_pts"] = data.groupby("player")["fantasy_points"].shift(-1)
-
-    # drop last season rows without next-season label
-    return data.dropna(subset=["target_next_pts"]).reset_index(drop=True)
+    required = {'player_id', 'season', 'fantasy_points'}
+    if not required.issubset(data):
+        raise ValueError(f'Missing feature inputs: {sorted(required - set(data))}')
+    if data.duplicated(['player_id', 'season']).any():
+        raise ValueError('Features require one row per player-season')
+    games = pd.to_numeric(data.get('games', pd.Series(np.nan, index=data.index)), errors='coerce')
+    data['ppg'] = data.fantasy_points / games.where(games > 0)
+    for pos in ['QB', 'RB', 'WR', 'TE']:
+        data[f'is_{pos.lower()}'] = (data.get('position', '') == pos).astype(int)
+    for column in FEATURE_COLUMNS:
+        if column not in data:
+            data[column] = np.nan
+    data[FEATURE_COLUMNS] = data[FEATURE_COLUMNS].astype(float).replace([np.inf, -np.inf], np.nan)
+    labels = data[['player_id', 'season', 'fantasy_points']].copy()
+    labels['season'] -= 1
+    labels = labels.rename(columns={'fantasy_points': TARGET_COLUMN})
+    # Keep unlabeled latest-season rows for genuine inference.
+    return data.merge(labels, on=['player_id', 'season'], how='left', validate='one_to_one').sort_values(
+        ['season', 'player_id']).reset_index(drop=True)

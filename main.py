@@ -1,7 +1,5 @@
-import pandas as pd
+"""Fantasy football training and saved-model prediction CLI."""
+from src.train import main
 
-csv_text = """"""
-
-with open('data/2023/defense.csv', 'w', encoding='utf-8') as f:
-    f.write(csv_text)
-
+if __name__ == '__main__':
+    raise SystemExit(main())
